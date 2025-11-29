@@ -21,13 +21,11 @@ def parse_chat_log(content):
     date_pattern = r'^\[(\d{1,2}/\d{1,2}/\d{2,4}),'
     
     # 2. Regex for Headers (Source -> Destination)
-    # Handles: "Goods From Store 4 to Shop 1", "Goods Received From Warehouse to Store"
-    # Case insensitive flags are applied in the search function
     movement_pattern = r'Goods (?:Received )?(?:From|Offloaded) (.+?) (?:to|To) (.+?)(?: on|$)'
     
     # 3. Regex for Items
-    # Handles: "Item Name: 50pcs" or "Item Name - 1ctn" or "Item Name: 10"
-    item_pattern = r'^(.+?)(?::|-| -)\s?(\d+)\s?([a-zA-Z]+)?'
+    # Updated to ensure we don't match lines starting with brackets [
+    item_pattern = r'^([^\[]+?)(?::|-| -)\s?(\d+)\s?([a-zA-Z]+)?'
 
     lines = content.split('\n')
     
@@ -39,32 +37,31 @@ def parse_chat_log(content):
         if date_match:
             current_date = date_match.group(1)
             
-            # Reset transaction state
-            # EXCLUDE "Goods Needed" messages (Request vs Actual Movement)
+            # If we hit a new message with a timestamp, strictly reset transaction 
+            # unless this specific message is a new Header.
+            is_valid_transaction = False
+
+            # EXCLUDE "Goods Needed" messages
             if "Needed" in line:
-                is_valid_transaction = False
                 continue
 
             # CHECK for valid movement header
             move_match = re.search(movement_pattern, line, re.IGNORECASE)
             if move_match:
                 current_source = move_match.group(1).strip()
-                # Clean up destination (remove trailing dates)
                 raw_dest = move_match.group(2).strip()
                 current_dest = raw_dest.split(' on ')[0].strip()
                 is_valid_transaction = True
                 continue 
 
-        # --- B. Process Items (Inside valid transaction) ---
+        # --- B. Process Items (Only inside valid transaction) ---
         if is_valid_transaction and current_source and current_dest:
+            # SECURITY CHECK: Skip lines that look like timestamps
+            if line.startswith("["):
+                continue
+
             # Clean line (remove numbering like "1.", "1)")
             clean_line = re.sub(r'^\d+[\).]\s?', '', line)
-            
-            # Stop if we hit a new timestamp line that ISN'T a header
-            if "[" in line and "]" in line and not re.search(movement_pattern, line, re.IGNORECASE):
-                # But sometimes users split headers and items in separate timestamps
-                # For safety, if it looks like a date but not a header, we assume new context
-                pass 
             
             # Extract Item
             item_match = re.search(item_pattern, clean_line)
@@ -73,8 +70,8 @@ def parse_chat_log(content):
                 qty = item_match.group(2)
                 unit = item_match.group(3) if item_match.group(3) else "pcs"
                 
-                # Filter out short noise/dates
-                if len(item_name) > 2 and " on " not in item_name:
+                # Filter out short noise
+                if len(item_name) > 2:
                     data.append({
                         "Date": current_date,
                         "Source": current_source,
@@ -90,9 +87,9 @@ def parse_chat_log(content):
 st.title("📦 Anik Stores - Warehouse Platform")
 st.markdown("""
 **How to use:**
-1. Open your WhatsApp Group.
-2. Tap Group Name -> **Export Chat** -> **Without Media**.
-3. Upload the `_chat.txt` file below.
+1. Export your WhatsApp Group Chat to **_chat.txt** (Without Media).
+2. Upload the file below.
+3. The system will auto-clean the data and remove timestamp errors.
 """)
 
 uploaded_file = st.file_uploader("Upload WhatsApp Chat (.txt)", type="txt")
@@ -108,7 +105,9 @@ if uploaded_file:
         # --- TOP METRICS ---
         st.divider()
         total_items = df['Quantity'].sum()
-        top_dest = df['Destination'].mode()[0]
+        
+        # Handle cases where mode() might be empty
+        top_dest = df['Destination'].mode()[0] if not df.empty else "N/A"
         
         c1, c2, c3 = st.columns(3)
         c1.metric("Total Items Moved", f"{total_items:,}")
@@ -158,4 +157,4 @@ if uploaded_file:
             )
 
     else:
-        st.warning("No stock movements found. Please upload a valid chat export.")
+        st.warning("No stock movements found. Please ensure your chat file has lines like 'Goods From Store to Shop'.")
