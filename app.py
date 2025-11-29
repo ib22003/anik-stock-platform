@@ -1,30 +1,21 @@
-import streamlit as st
-import pandas as pd
-import re
-import plotly.express as px
-import io
-
-# --- CONFIGURATION ---
-st.set_page_config(page_title="Anik Stores Inventory", layout="wide")
-
-# --- PARSING ENGINE ---
 def parse_chat_log(content):
     data = []
     
-    # Context variables
+    # State variables
     current_date = None
+    current_time = None  # NEW: Track time to prevent duplicates
     current_source = None
     current_dest = None
     is_valid_transaction = False
     
-    # 1. Regex for Date [27/1/25...] or [1/27/25...]
-    date_pattern = r'^\[(\d{1,2}/\d{1,2}/\d{2,4}),'
+    # 1. Regex to find Date AND Time
+    # Matches: [1/27/25, 8:07:58 AM]
+    timestamp_pattern = r'^\[(\d{1,2}/\d{1,2}/\d{2,4}),\s?(\d{1,2}:\d{2}:\d{2}\s?[AP]M)\]'
     
-    # 2. Regex for Headers (Source -> Destination)
+    # 2. Movement Headers
     movement_pattern = r'Goods (?:Received )?(?:From|Offloaded) (.+?) (?:to|To) (.+?)(?: on|$)'
     
-    # 3. Regex for Items
-    # Updated to ensure we don't match lines starting with brackets [
+    # 3. Items (Ignore lines starting with [ to avoid timestamp errors)
     item_pattern = r'^([^\[]+?)(?::|-| -)\s?(\d+)\s?([a-zA-Z]+)?'
 
     lines = content.split('\n')
@@ -32,16 +23,16 @@ def parse_chat_log(content):
     for line in lines:
         line = line.strip()
         
-        # --- A. Check for New Message / Date ---
-        date_match = re.match(date_pattern, line)
-        if date_match:
-            current_date = date_match.group(1)
+        # --- A. Check for Timestamp ---
+        ts_match = re.match(timestamp_pattern, line)
+        if ts_match:
+            current_date = ts_match.group(1)
+            current_time = ts_match.group(2) # Capture time
             
-            # If we hit a new message with a timestamp, strictly reset transaction 
-            # unless this specific message is a new Header.
+            # Reset transaction state
             is_valid_transaction = False
 
-            # EXCLUDE "Goods Needed" messages
+            # EXCLUDE "Goods Needed"
             if "Needed" in line:
                 continue
 
@@ -54,26 +45,22 @@ def parse_chat_log(content):
                 is_valid_transaction = True
                 continue 
 
-        # --- B. Process Items (Only inside valid transaction) ---
+        # --- B. Process Items ---
         if is_valid_transaction and current_source and current_dest:
-            # SECURITY CHECK: Skip lines that look like timestamps
-            if line.startswith("["):
-                continue
+            if line.startswith("["): continue
 
-            # Clean line (remove numbering like "1.", "1)")
             clean_line = re.sub(r'^\d+[\).]\s?', '', line)
             
-            # Extract Item
             item_match = re.search(item_pattern, clean_line)
             if item_match:
                 item_name = item_match.group(1).strip()
                 qty = item_match.group(2)
                 unit = item_match.group(3) if item_match.group(3) else "pcs"
                 
-                # Filter out short noise
                 if len(item_name) > 2:
                     data.append({
                         "Date": current_date,
+                        "Time": current_time, # Store time for ID
                         "Source": current_source,
                         "Destination": current_dest,
                         "Item": item_name,
@@ -81,80 +68,11 @@ def parse_chat_log(content):
                         "Unit": unit.lower()
                     })
 
-    return pd.DataFrame(data)
-
-# --- USER INTERFACE ---
-st.title("📦 Anik Stores - Warehouse Platform")
-st.markdown("""
-**How to use:**
-1. Export your WhatsApp Group Chat to **_chat.txt** (Without Media).
-2. Upload the file below.
-3. The system will auto-clean the data and remove timestamp errors.
-""")
-
-uploaded_file = st.file_uploader("Upload WhatsApp Chat (.txt)", type="txt")
-
-if uploaded_file:
-    text_content = uploaded_file.read().decode("utf-8")
-    df = parse_chat_log(text_content)
+    df = pd.DataFrame(data)
     
+    # --- C. THE DUPLICATE CHECKER ---
+    # This removes rows where EVERYTHING (Date, Time, Item, Qty) is exactly the same.
     if not df.empty:
-        # Convert Date
-        df["Date"] = pd.to_datetime(df["Date"], errors='coerce')
+        df = df.drop_duplicates()
         
-        # --- TOP METRICS ---
-        st.divider()
-        total_items = df['Quantity'].sum()
-        
-        # Handle cases where mode() might be empty
-        top_dest = df['Destination'].mode()[0] if not df.empty else "N/A"
-        
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total Items Moved", f"{total_items:,}")
-        c2.metric("Total Transactions", len(df))
-        c3.metric("Top Receiver", top_dest)
-        
-        st.divider()
-        
-        # --- TABS ---
-        tab1, tab2 = st.tabs(["📊 Dashboard", "📄 Stock Data"])
-        
-        with tab1:
-            # 1. Movement by Shop
-            st.subheader("Where is stock going?")
-            dest_group = df.groupby("Destination")["Quantity"].sum().reset_index().sort_values("Quantity", ascending=False)
-            fig_dest = px.bar(dest_group, x="Quantity", y="Destination", orientation='h', text="Quantity")
-            st.plotly_chart(fig_dest, use_container_width=True)
-            
-            # 2. Source Analysis
-            st.subheader("Where is stock coming from?")
-            source_group = df.groupby("Source")["Quantity"].sum().reset_index()
-            fig_src = px.pie(source_group, values="Quantity", names="Source", hole=0.4)
-            st.plotly_chart(fig_src, use_container_width=True)
-
-        with tab2:
-            st.subheader("Search & Download")
-            
-            # Search Bar
-            search = st.text_input("Search for an item (e.g. 'Korkmaz', 'Pizza Plate')")
-            if search:
-                display_df = df[df['Item'].str.contains(search, case=False, na=False)]
-            else:
-                display_df = df
-            
-            st.dataframe(display_df, use_container_width=True)
-            
-            # Excel Download
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                display_df.to_excel(writer, index=False, sheet_name='Stock Data')
-                
-            st.download_button(
-                label="📥 Download as Excel",
-                data=buffer.getvalue(),
-                file_name="anik_stock_report.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
-    else:
-        st.warning("No stock movements found. Please ensure your chat file has lines like 'Goods From Store to Shop'.")
+    return df
